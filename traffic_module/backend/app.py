@@ -2539,8 +2539,10 @@ async def _stop_citizen_alert_dispatch_loop():
     try:
         await _citizen_dispatch_task
     except asyncio.CancelledError:
+        
         pass
     _citizen_dispatch_task = None
+
 
 
 # ---------------- MAIN ----------------

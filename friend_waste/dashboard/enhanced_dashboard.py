@@ -34,6 +34,17 @@ from folium import plugins
 from streamlit_folium import st_folium
 from datetime import datetime
 import requests
+import html
+import base64
+import mimetypes
+
+# Optional browser geolocation component (install with: pip install streamlit-geolocation)
+try:
+    from streamlit_geolocation import streamlit_geolocation
+    GEOLOCATION_COMPONENT_AVAILABLE = True
+except ImportError:
+    streamlit_geolocation = None
+    GEOLOCATION_COMPONENT_AVAILABLE = False
 
 # Try to import optional dependencies
 try:
@@ -47,12 +58,12 @@ except ImportError:
 # PATHS
 # ============================================================
 
-BASE_DIR = os.path.dirname(
-    os.path.dirname(os.path.abspath(__file__))
-)
-SATELLITE_OUTPUT  = os.path.join(BASE_DIR, "satellite", "outputs")
-PROCESSED_DIR     = os.path.join(BASE_DIR, "data", "processed")
-DATA_DIR           = os.path.join(BASE_DIR, "data")
+# The dashboard is in <project root>/dashboard, so its parent is the project root.
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+SATELLITE_OUTPUT = os.path.join(BASE_DIR, "satellite", "outputs")
+PROCESSED_DIR = os.path.join(BASE_DIR, "data", "processed")
+DATA_DIR = os.path.join(BASE_DIR, "data")
 FLEET_DIR          = os.path.join(PROCESSED_DIR, "fleet")
 VALIDATION_DIR      = os.path.join(PROCESSED_DIR, "validation")
 SCENARIO_DIR        = os.path.join(PROCESSED_DIR, "scenarios")
@@ -73,8 +84,8 @@ POI_REGRESSION_PREDICTIONS_FILE = os.path.join(PROCESSED_DIR, "bengaluru_poi_reg
 POI_REGRESSION_CHART_FILE = os.path.join(PROCESSED_DIR, "poi_regression_comparison.png")
 TREND_EARLY_WARNING_FILE = os.path.join(PROCESSED_DIR, "bengaluru_trend_early_warning.csv")
 TREND_BACKTEST_CHART_FILE = os.path.join(PROCESSED_DIR, "trend_backtest_validation.png")
-REPORTS_FILE           = os.path.join(BASE_DIR, "data", "citizen_reports.json")
-REPORTS_PHOTOS_DIR     = os.path.join(BASE_DIR, "data", "citizen_report_photos")
+REPORTS_FILE           = os.path.join(DATA_DIR, "citizen_reports.json")
+REPORTS_PHOTOS_DIR     = os.path.join(DATA_DIR, "citizen_report_photos")
 
 # New files from enhancements
 MULTI_SENSOR_FILE     = os.path.join(PROCESSED_DIR, "multi_sensor_grid_features.csv")
@@ -237,6 +248,74 @@ else:
     st.error("Failed to load data. Please ensure output files exist.")
     st.stop()
 
+def find_col(df, candidates):
+    """Find the first matching DataFrame column, ignoring letter case."""
+    if df is None or not hasattr(df, "columns"):
+        return None
+
+    lower_map = {str(column).lower(): column for column in df.columns}
+    for candidate in candidates:
+        match = lower_map.get(str(candidate).lower())
+        if match is not None:
+            return match
+    return None
+
+
+# Add the requested major Bengaluru calendar holidays to Event Intelligence.
+# These are calendar entries only: no grid impacts or waste predictions are fabricated.
+_today_for_events = pd.Timestamp(datetime.now().date())
+_calendar_holidays = [
+    {"name": "Diwali (Deepavali)", "date": "2026-11-08", "type": "Festival"},
+    {"name": "Christmas", "date": "2026-12-25", "type": "Festival"},
+    {"name": "New Year's Day", "date": "2027-01-01", "type": "Holiday"},
+]
+if events.empty:
+    events = pd.DataFrame(columns=["event_name", "event_type", "event_date", "area_name", "event_source"])
+
+_event_name_col = find_col(events, ["event_name", "name", "title"])
+for _holiday in _calendar_holidays:
+    _holiday_date = pd.Timestamp(_holiday["date"])
+    if _holiday_date < _today_for_events:
+        continue
+
+    _holiday_name = _holiday["name"]
+    _holiday_pattern = "diwali|deepavali" if "diwali" in _holiday_name.lower() else (
+        "christmas" if "christmas" in _holiday_name.lower() else "new year|new year's day"
+    )
+    _existing_mask = (
+        events[_event_name_col].astype(str).str.contains(_holiday_pattern, case=False, na=False)
+        if _event_name_col else pd.Series(False, index=events.index)
+    )
+
+    if not _existing_mask.any():
+        _holiday_row = {column: None for column in events.columns}
+        _holiday_row.update({
+            "event_name": _holiday_name,
+            "name": _holiday_name,
+            "title": _holiday_name,
+            "event_type": _holiday["type"],
+            "type": _holiday["type"],
+            "event_date": _holiday["date"],
+            "date": _holiday["date"],
+            "start_date": _holiday["date"],
+            "start_datetime": _holiday["date"],
+            "area_name": "Bengaluru",
+            "area": "Bengaluru",
+            "location": "Bengaluru",
+            "event_source": "Bengaluru public holiday calendar (manual fallback)",
+        })
+        if _event_name_col:
+            _holiday_row[_event_name_col] = _holiday_name
+        events = pd.concat([events, pd.DataFrame([_holiday_row])], ignore_index=True)
+    else:
+        # Keep scraper-provided details, filling only missing date fields.
+        _idx = events[_existing_mask].index[0]
+        for _date_column in ["event_date", "start_date", "start_datetime", "date"]:
+            if _date_column not in events.columns:
+                events[_date_column] = pd.NA
+            if pd.isna(events.at[_idx, _date_column]):
+                events.at[_idx, _date_column] = _holiday["date"]
+
 # Numeric fix for routes
 if not routes.empty:
     for col in ["event_aware_risk_score","distance_from_previous_km",
@@ -275,6 +354,7 @@ def normalize_ortools_routes(df):
 ortools_routes = normalize_ortools_routes(ortools_routes_raw)
 
 # Build area centroid lookup
+centroids = gpd.GeoDataFrame()
 if not areas.empty:
     areas_geo = areas.copy()
     areas_geo = areas_geo.to_crs("EPSG:32643")
@@ -301,6 +381,152 @@ ROUTE_COLORS = [
 ]
 
 AVG_TRUCK_SPEED_KMH = 22  # rough average incl. city stop-and-go, for ETA estimates
+
+
+def _normalise_ward_name(value):
+    """Normalise ward labels so small casing/spacing differences do not hide reports."""
+    if value is None or pd.isna(value):
+        return ""
+    return " ".join(str(value).strip().casefold().split())
+
+
+def resolve_report_photo_path(photo_value):
+    """Resolve a saved citizen photo path across absolute and relative path formats."""
+    if photo_value is None or pd.isna(photo_value):
+        return None
+    raw_path = str(photo_value).strip()
+    if not raw_path or raw_path.casefold() in {"none", "nan", "null"}:
+        return None
+
+    candidates = [raw_path]
+    if not os.path.isabs(raw_path):
+        candidates.extend([
+            os.path.join(BASE_DIR, raw_path),
+            os.path.join(REPORTS_PHOTOS_DIR, os.path.basename(raw_path)),
+        ])
+    else:
+        candidates.append(os.path.join(REPORTS_PHOTOS_DIR, os.path.basename(raw_path)))
+
+    for candidate in candidates:
+        candidate = os.path.normpath(candidate)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def reports_for_ward(ward_name):
+    """Return citizen reports assigned to a ward, matching labels robustly."""
+    if citizen_reports.empty or not ward_name:
+        return pd.DataFrame()
+    if "matched_ward" not in citizen_reports.columns:
+        return pd.DataFrame()
+    target = _normalise_ward_name(ward_name)
+    mask = citizen_reports["matched_ward"].apply(_normalise_ward_name) == target
+    return citizen_reports.loc[mask].copy()
+
+
+def latest_report_for_ward(ward_name):
+    """Return only the newest citizen report for a ward."""
+    ward_reports = reports_for_ward(ward_name)
+    if ward_reports.empty:
+        return pd.DataFrame()
+    if "submitted_at" in ward_reports.columns:
+        ward_reports = ward_reports.sort_values("submitted_at", ascending=False, na_position="last")
+    return ward_reports.head(1).copy()
+
+
+def get_builtup_coverage_percent(area_name):
+    """Return ward-level mapped building-footprint coverage.
+
+    The satellite extractor writes Builtup_Coverage_Percent per Grid_ID.
+    Join those grid records to bengaluru_grid_area_mapping.csv and average
+    the grid coverage values for the requested ward. Values are sourced from
+    OSM building footprints, not inferred from NDBI.
+    """
+    coverage_col_candidates = [
+        "Builtup_Coverage_Percent", "Built_Up_Coverage_Percent",
+        "BuiltUp_Coverage_Percent", "building_coverage_percent",
+        "builtup_coverage_pct", "Building_Coverage_Pct",
+        "Builtup_Density_Percent", "Building_Coverage_Percent",
+        "Building_Coverage", "Builtup_Coverage", "Built_Up_Percent",
+        "built_up_density_percent"
+    ]
+
+    # 1) Direct ward-level value, if a processed file already contains one.
+    for frame in (areas, multi_sensor, landuse_changes):
+        if frame is None or frame.empty or "area_name" not in frame.columns:
+            continue
+        coverage_col = find_col(frame, coverage_col_candidates)
+        if coverage_col is None:
+            continue
+        match = frame[frame["area_name"].astype(str).map(_normalise_ward_name)
+                      == _normalise_ward_name(area_name)]
+        if not match.empty:
+            value = pd.to_numeric(match.iloc[0][coverage_col], errors="coerce")
+            if pd.notna(value):
+                value = float(value)
+                return value * 100 if 0 <= value <= 1 else value
+
+    # 2) Actual project pipeline: coverage is stored per grid cell in
+    # bengaluru_satellite_features.csv and ward names live in the grid mapping.
+    if (sat_features is not None and not sat_features.empty
+            and grid_area_mapping is not None and not grid_area_mapping.empty):
+        sf_id_col = find_col(sat_features, GRID_ID_CANDIDATES)
+        gm_id_col = find_col(grid_area_mapping, GRID_ID_CANDIDATES)
+        gm_area_col = find_col(grid_area_mapping, ["area_name"])
+        coverage_col = find_col(sat_features, coverage_col_candidates)
+
+        if sf_id_col and gm_id_col and gm_area_col and coverage_col:
+            coverage_rows = sat_features[[sf_id_col, coverage_col]].copy()
+            mapping_rows = grid_area_mapping[[gm_id_col, gm_area_col]].copy()
+            coverage_rows["_grid_key"] = coverage_rows[sf_id_col].astype(str).str.strip()
+            mapping_rows["_grid_key"] = mapping_rows[gm_id_col].astype(str).str.strip()
+            joined = coverage_rows.merge(
+                mapping_rows[["_grid_key", gm_area_col]],
+                on="_grid_key", how="inner"
+            )
+            joined[coverage_col] = pd.to_numeric(joined[coverage_col], errors="coerce")
+            ward_rows = joined[
+                joined[gm_area_col].astype(str).map(_normalise_ward_name)
+                == _normalise_ward_name(area_name)
+            ].dropna(subset=[coverage_col])
+
+            if not ward_rows.empty:
+                # Each grid cell has the same nominal size in this project;
+                # mean grid coverage therefore gives the ward coverage estimate.
+                value = float(ward_rows[coverage_col].mean())
+                return value * 100 if 0 <= value <= 1 else value
+
+    return None
+
+
+def match_report_to_ward(latitude, longitude):
+    """Match GPS coordinates to a ward polygon; use a conservative centroid fallback."""
+    if latitude is None or longitude is None or areas.empty:
+        return None
+    try:
+        from shapely.geometry import Point
+        point = gpd.GeoSeries([Point(float(longitude), float(latitude))], crs="EPSG:4326")
+        ward_shapes = areas.to_crs("EPSG:4326") if areas.crs else areas.set_crs("EPSG:4326")
+        point_geom = point.iloc[0]
+        matches = ward_shapes[ward_shapes.geometry.notna() & ward_shapes.geometry.contains(point_geom)]
+        if not matches.empty:
+            return str(matches.iloc[0]["area_name"])
+    except Exception:
+        pass
+
+    # If the source polygons do not cover the point, only use a close centroid.
+    try:
+        if "centroids" in globals() and not centroids.empty:
+            distances = centroids.apply(
+                lambda row: haversine_km(float(latitude), float(longitude),
+                                         float(row["Latitude"]), float(row["Longitude"])), axis=1)
+            nearest_idx = distances.idxmin()
+            if float(distances.loc[nearest_idx]) <= 2.0:
+                return str(centroids.loc[nearest_idx, "area_name"])
+    except Exception:
+        pass
+    return None
 
 def haversine_km(lat1, lon1, lat2, lon2):
     """Real ground distance in km between two lat/lon points (not raw degree math)."""
@@ -335,13 +561,6 @@ route_ids  = sorted(routes["truck_id"].unique()) if not routes.empty else []
 labels     = {tid: f"Route {i+1}" for i,tid in enumerate(route_ids)}
 rev_labels = {v:k for k,v in labels.items()}
 
-def find_col(df, candidates):
-    """Case-insensitive lookup for the first matching column name in a DataFrame."""
-    lower_map = {c.lower(): c for c in df.columns}
-    for cand in candidates:
-        if cand.lower() in lower_map:
-            return lower_map[cand.lower()]
-    return None
 
 GRID_ID_CANDIDATES = ["Grid_ID", "grid_id", "GridID", "grid_cell_id", "cell_id"]
 
@@ -475,7 +694,7 @@ def compute_area_satellite_indices(area_name, lat_a, lon_a):
     ndwi_avg = nearby["NDWI"].mean() if "NDWI" in nearby.columns else None
     return ndvi_avg, ndbi_avg, ndwi_avg, coverage_note, True
 
-def build_risk_factors(area_name, risk, area_info, in_priority, ndvi_avg, ndbi_avg):
+def build_risk_factors(area_name, risk, area_info, in_priority, ndvi_avg, builtup_coverage_pct):
     """Assemble a short, human-readable list of why an area is flagged at its current risk level."""
     factors = []
 
@@ -504,8 +723,8 @@ def build_risk_factors(area_name, risk, area_info, in_priority, ndvi_avg, ndbi_a
                     f"Recent land-use change increasing waste generation "
                     f"({len(up_changes)} change{'s' if len(up_changes) != 1 else ''})")
 
-    if ndbi_avg is not None and ndbi_avg > 0.1:
-        factors.append(f"High built-up density nearby (NDBI {ndbi_avg:.2f}) — dense development, less green buffer")
+    if builtup_coverage_pct is not None and builtup_coverage_pct >= 30:
+        factors.append(f"High mapped building coverage nearby ({builtup_coverage_pct:.1f}%)")
     if ndvi_avg is not None and ndvi_avg < 0.1:
         factors.append(f"Very limited vegetation cover nearby (NDVI {ndvi_avg:.2f})")
 
@@ -608,9 +827,10 @@ def display_area_details(area_name):
 
     # "Why is this area flagged" factor breakdown
     in_priority = area_name in routes["area_name"].values if not routes.empty else False
-    ndvi_avg, ndbi_avg, ndwi_avg, sat_coverage_note, has_sat_data = compute_area_satellite_indices(
+    ndvi_avg, _ndbi_internal, ndwi_avg, sat_coverage_note, has_sat_data = compute_area_satellite_indices(
         area_name, lat_a, lon_a)
-    risk_factors = build_risk_factors(area_name, risk, area_info, in_priority, ndvi_avg, ndbi_avg)
+    builtup_coverage_pct = get_builtup_coverage_percent(area_name)
+    risk_factors = build_risk_factors(area_name, risk, area_info, in_priority, ndvi_avg, builtup_coverage_pct)
 
     st.markdown(f"""
     <div class="info-panel {risk.lower()}">
@@ -645,61 +865,52 @@ def display_area_details(area_name):
             f"{datetime.now().strftime('%d %b %Y %H:%M')}</div>",
             unsafe_allow_html=True)
 
-        # Satellite indices chart
-        st.markdown("##### NDVI / NDBI / NDWI Analysis")
+        # Satellite vegetation/moisture plus mapped building-footprint coverage.
+        st.markdown("##### Vegetation, Built-up Coverage & Moisture")
 
         if sat_coverage_note:
             st.info(sat_coverage_note)
 
         if has_sat_data:
-            ndvi_avg = ndvi_avg or 0
-            ndbi_avg = ndbi_avg or 0
-            ndwi_avg = ndwi_avg or 0
+            ndvi_value = float(ndvi_avg) if ndvi_avg is not None and pd.notna(ndvi_avg) else 0.0
+            ndwi_value = float(ndwi_avg) if ndwi_avg is not None and pd.notna(ndwi_avg) else 0.0
+            m1, m2, m3 = st.columns(3)
+            m1.metric("NDVI — Vegetation", f"{ndvi_value:.3f}")
+            m2.metric("Mapped Building Coverage (OSM)", f"{builtup_coverage_pct:.1f}%" if builtup_coverage_pct is not None else "Not available")
+            m3.metric("NDWI — Moisture", f"{ndwi_value:.3f}")
 
-            m1,m2,m3 = st.columns(3)
-            m1.metric("NDVI — Vegetation", f"{ndvi_avg:.3f}")
-            m2.metric("NDBI — Built-up", f"{ndbi_avg:.3f}")
-            m3.metric("NDWI — Moisture", f"{ndwi_avg:.3f}")
+            chart_labels = ["NDVI (Vegetation)", "NDWI (Moisture)"]
+            chart_values = [ndvi_value, ndwi_value]
+            chart_colors = ["#52b788", "#457b9d"]
+            if builtup_coverage_pct is not None:
+                chart_labels.insert(1, "Mapped Building Coverage (OSM) (%)")
+                chart_values.insert(1, builtup_coverage_pct)
+                chart_colors.insert(1, "#e76f51")
 
-            # Enhanced visualization
-            fig = go.Figure()
-            fig.add_trace(go.Bar(
-                x=["NDVI (Vegetation)", "NDBI (Built-up)", "NDWI (Moisture)"],
-                y=[ndvi_avg, ndbi_avg, ndwi_avg],
-                marker_color=["#52b788","#e63946","#457b9d"],
-                text=[f"{ndvi_avg:.3f}",f"{ndbi_avg:.3f}",f"{ndwi_avg:.3f}"],
-                textposition="outside",
-                textfont=dict(size=12, color="#1b4332")
+            fig = go.Figure(go.Bar(
+                x=chart_labels, y=chart_values, marker_color=chart_colors,
+                text=[f"{v:.1f}%" if "Coverage" in label else f"{v:.3f}" for label, v in zip(chart_labels, chart_values)],
+                textposition="outside", textfont=dict(size=12, color="#1b4332")
             ))
             fig.update_layout(
-                title=f"Satellite Indices - {area_name}",
-                plot_bgcolor="white", paper_bgcolor="white",
-                height=350, margin=dict(t=40,b=20,l=20,r=20),
-                font_family="Inter",
-                yaxis=dict(range=[-1,1], title="Index Value"),
-                annotations=[
-                    dict(x=0,y=-0.15,xref="x",yref="paper",
-                         text="Vegetation Density",showarrow=False,
-                         font=dict(size=11,color="#888")),
-                    dict(x=1,y=-0.15,xref="x",yref="paper",
-                         text="Built-up Density",showarrow=False,
-                         font=dict(size=11,color="#888")),
-                    dict(x=2,y=-0.15,xref="x",yref="paper",
-                         text="Moisture Index",showarrow=False,
-                         font=dict(size=11,color="#888")),
-                ]
+                title=f"Ward Environmental Profile — {area_name}",
+                plot_bgcolor="white", paper_bgcolor="white", height=350,
+                margin=dict(t=40, b=20, l=20, r=20), font_family="Inter",
+                yaxis=dict(title="Coverage (%) / Index value")
             )
             st.plotly_chart(fig, use_container_width=True)
 
-            # Detailed interpretation
+            coverage_text = (f"🏢 <b>Mapped building coverage {builtup_coverage_pct:.1f}%</b> — "
+                             "share of ward area covered by mapped OSM building footprints.<br>"
+                             if builtup_coverage_pct is not None else
+                             "🏢 <b>Mapped building coverage</b> — source coverage field is unavailable for this ward.<br>")
             st.markdown(f"""
             <div class="info-box">
-              🌱 <b>NDVI {ndvi_avg:.3f}</b> — 
-              {'🌳 High vegetation - green area' if ndvi_avg > 0.3 else '🏙️ Urban area - limited vegetation' if ndvi_avg > 0.1 else '🏢 Dense urban - very limited vegetation'}<br>
-              🏙️ <b>NDBI {ndbi_avg:.3f}</b> — 
-              {'🏢 High built-up density' if ndbi_avg > 0.1 else '🌳 Moderate built-up area'}<br>
-              💧 <b>NDWI {ndwi_avg:.3f}</b> — 
-              {'💧 High moisture content' if ndwi_avg > 0.1 else '🏜️ Normal moisture levels'}
+              🌱 <b>NDVI {ndvi_value:.3f}</b> —
+              {'🌳 Higher vegetation signal' if ndvi_value > 0.3 else '🏙️ Urban area / limited vegetation' if ndvi_value > 0.1 else '🏢 Very limited vegetation signal'}<br>
+              {coverage_text}
+              💧 <b>NDWI {ndwi_value:.3f}</b> —
+              {'💧 Higher moisture signal' if ndwi_value > 0.1 else '🏜️ Lower moisture signal'}
             </div>
             """, unsafe_allow_html=True)
         else:
@@ -718,26 +929,24 @@ def display_area_details(area_name):
                 ward_reports = ward_reports.sort_values("submitted_at", ascending=False)
                 st.markdown(f"**{len(ward_reports)} report(s)** submitted for this ward.")
                 for _, rep in ward_reports.iterrows():
-                    rc1, rc2 = st.columns([1, 3])
-                    with rc1:
-                        if rep.get("photo_path") and os.path.exists(str(rep["photo_path"])):
-                            st.image(rep["photo_path"], use_container_width=True)
-                        else:
-                            st.caption("No photo")
-                    with rc2:
-                        sev = rep.get("severity", "medium")
-                        submitted_dt = rep.get("submitted_at", "")
-                        st.markdown(f"""
-                        <div style="padding:4px 0;">
-                          <span class="badge badge-{sev}">{sev}</span>
-                          <b style="margin-left:8px;color:#1b4332;">{rep.get('waste_type', 'garbage')}</b>
-                          <div style="font-size:0.82rem;color:#888;margin-top:2px;">{submitted_dt}</div>
-                          <div style="font-size:0.85rem;color:#555;margin-top:4px;">
-                            {rep.get('landmark') or ''} {('— ' + rep.get('description')) if rep.get('description') else ''}
-                          </div>
-                        </div>
-                        """, unsafe_allow_html=True)
-                    st.markdown("<hr style='margin:8px 0;border-color:#eee;'>", unsafe_allow_html=True)
+                    # Keep this detail tab text-only. The single latest photo is
+                    # displayed once in the Overview/Risk Map section above.
+                    sev = html.escape(str(rep.get("severity", "medium")))
+                    waste = html.escape(str(rep.get("waste_type", "garbage")))
+                    submitted_dt = html.escape(str(rep.get("submitted_at", "")))
+                    landmark = html.escape(str(rep.get("landmark") or ""))
+                    description = html.escape(str(rep.get("description") or ""))
+                    st.markdown(f"""
+                    <div style="padding:8px 0;">
+                      <span class="badge badge-{sev}">{sev}</span>
+                      <b style="margin-left:8px;color:#1b4332;">{waste}</b>
+                      <div style="font-size:0.82rem;color:#888;margin-top:2px;">{submitted_dt}</div>
+                      <div style="font-size:0.85rem;color:#555;margin-top:4px;">
+                        {landmark} {('— ' + description) if description else ''}
+                      </div>
+                    </div>
+                    <hr style='margin:8px 0;border-color:#eee;'>
+                    """, unsafe_allow_html=True)
 
 # ============================================================
 # PAGE — ENHANCED RISK MAP
@@ -1254,7 +1463,7 @@ elif page == "Risk Map":
 
         st.markdown('<h2 style="color:#1b4332;font-family:\'DM Serif Display\';serif;font-weight:400;">Enhanced Risk Map — Click for Details</h2>',
                     unsafe_allow_html=True)
-        st.markdown("Click any ward marker to see satellite imagery, NDVI/NDBI/NDWI indices, and multi-sensor data.")
+        st.markdown("Click any ward marker to see satellite imagery, vegetation, mapped building coverage, moisture, and multi-sensor data.")
 
         # Risk-level filter + clustering toggle — useful once you're plotting all 369 wards
         filter_col, cluster_col = st.columns([3,1])
@@ -1280,9 +1489,19 @@ elif page == "Risk Map":
             st.session_state.selected_area = None
 
         # Build map with click handling
+        # When a ward is searched, focus the overview map on that ward.
+        map_center = [12.9716, 77.5946]
+        map_zoom = 11
+        if search_area != "-- Select ward --" and not centroids.empty:
+            matched_center = centroids[centroids["area_name"].astype(str) == str(search_area)]
+            if not matched_center.empty:
+                map_center = [float(matched_center.iloc[0]["Latitude"]),
+                              float(matched_center.iloc[0]["Longitude"])]
+                map_zoom = 14
+
         m = folium.Map(
-            location=[12.9716,77.5946],
-            zoom_start=11,
+            location=map_center,
+            zoom_start=map_zoom,
             tiles="OpenStreetMap"
         )
 
@@ -1315,16 +1534,21 @@ elif page == "Risk Map":
             opacity     = 0.95 if in_priority else 0.65
             plotted_count += 1
 
+            # Keep the ward marker focused on predicted risk. The latest citizen
+            # report photo is displayed once below the map for the searched ward.
+            ward_reports_for_popup = latest_report_for_ward(name)
+            if not ward_reports_for_popup.empty:
+                report_status = "Latest citizen report available — see below the map."
+            else:
+                report_status = "No citizen-submitted reports for this ward yet."
+
             popup_html = f"""
-            <div style='font-family:sans-serif;min-width:220px;'>
-              <b style='color:#1b4332;font-size:14px;'>{name}</b><br>
+            <div style='font-family:sans-serif;min-width:210px;max-width:280px;'>
+              <b style='color:#1b4332;font-size:14px;'>{html.escape(str(name))}</b><br>
               <span style="background:{rc};color:white;padding:2px 8px;border-radius:8px;font-size:10px;font-weight:600;">
-                {risk}
+                {html.escape(str(risk))}
               </span><br>
-              <br>
-              <button onclick="selectArea('{name}')" style='background:#1b4332;color:white;border:none;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:11px;margin-top:8px;'>
-                📸 View Satellite Details
-              </button>
+              <small style='display:block;margin-top:7px;color:#555;'>{html.escape(report_status)}</small>
             </div>
             """
 
@@ -1336,12 +1560,22 @@ elif page == "Risk Map":
                          background:{rc};opacity:{opacity};border:2px solid white;
                          box-shadow:0 1px 4px rgba(0,0,0,0.35);"></div>
                 """, icon_size=(diameter, diameter), icon_anchor=(diameter//2, diameter//2)),
-                popup=folium.Popup(popup_html, max_width=260)
+                popup=folium.Popup(popup_html, max_width=340)
             ).add_to(marker_target)
 
+        # Count reports for the selected ward for context; photos themselves are
+        # displayed inside that ward's existing overview-map marker popup.
+        if search_area != "-- Select ward --":
+            visible_reports = len(reports_for_ward(search_area))
+            report_scope = f"for {search_area}"
+        else:
+            visible_reports = len(citizen_reports) if not citizen_reports.empty else 0
+            report_scope = "across all wards"
         st.markdown(
             f"<div style='font-size:0.78rem;color:#888;margin:-6px 0 10px;'>"
-            f"Showing {plotted_count} of {len(centroids)} wards</div>",
+            f"Showing {plotted_count} of {len(centroids)} wards · "
+            f"{visible_reports} citizen report(s) {report_scope}. "
+            "Select a ward marker to view its submitted photos and report details.</div>",
             unsafe_allow_html=True)
 
         # Add click listener via JavaScript
@@ -1358,9 +1592,32 @@ elif page == "Risk Map":
 
         st_folium(m, width=None, height=500)
 
-        # Display detailed area information when selected
+        # Show exactly one latest citizen report image on the Overview/Risk Map
+        # page itself, for the ward selected in the search box. The marker popup
+        # contains no embedded image, preventing duplicate photo display.
         if search_area != "-- Select ward --":
             st.session_state.selected_area = search_area
+            latest_report = latest_report_for_ward(search_area)
+            st.markdown("### 📸 Latest Citizen Report")
+            if latest_report.empty:
+                st.info(f"No citizen reports have been submitted for {search_area} yet.")
+            else:
+                report = latest_report.iloc[0]
+                photo_file = resolve_report_photo_path(report.get("photo_path"))
+                if photo_file:
+                    st.image(photo_file, caption=f"Latest report from {search_area}", width=520)
+                else:
+                    st.info("The latest report has no photo, or its saved photo file could not be found.")
+                report_col1, report_col2, report_col3 = st.columns(3)
+                report_col1.metric("Waste type", str(report.get("waste_type") or "Not specified").replace("_", " ").title())
+                report_col2.metric("Severity", str(report.get("severity") or "Not specified").title())
+                report_col3.metric("Submitted", str(report.get("submitted_at") or "Not available"))
+                landmark_value = str(report.get("landmark") or "").strip()
+                description_value = str(report.get("description") or "").strip()
+                if landmark_value:
+                    st.write(f"**Landmark:** {landmark_value}")
+                if description_value:
+                    st.write(f"**Description:** {description_value}")
 
         if st.session_state.selected_area:
             display_area_details(st.session_state.selected_area)
@@ -1371,7 +1628,7 @@ elif page == "Risk Map":
                     unsafe_allow_html=True)
         st.markdown(
             "Three independently-built predictions for the same wards, compared side by side: "
-            "the satellite-based model (NDVI/NDBI/NDWI), a per-capita generation model "
+            "the satellite-based model (vegetation and moisture indices), a per-capita generation model "
             "(population × published waste rates), and a POI-density regression (OSM building/shop "
             "density). Agreement between independent approaches is a form of cross-validation; "
             "disagreement highlights wards worth a closer look."
@@ -1474,7 +1731,7 @@ elif page == "Risk Map":
         st.markdown('<h2 style="color:#1b4332;font-family:\'DM Serif Display\';serif;font-weight:400;">Land Use Profile</h2>',
                     unsafe_allow_html=True)
         st.markdown(
-            "Current land cover per ward, classified from satellite NDVI/NDBI/NDWI signals. "
+            "Current land cover per ward, classified from satellite vegetation and moisture signals. "
             "**This is a snapshot, not change-over-time detection** — only one satellite pass "
             "is available, so there's nothing to compare it against yet."
         )
@@ -1585,8 +1842,8 @@ elif page == "Risk Map":
                       <div style="font-weight:700;color:#1b4332;">{row['Land_Use_Category']}</div></div>
                     <div><div style="font-size:0.72rem;color:#888;text-transform:uppercase;">NDVI</div>
                       <div style="font-weight:700;">{row.get('NDVI', float('nan')):.3f}</div></div>
-                    <div><div style="font-size:0.72rem;color:#888;text-transform:uppercase;">NDBI</div>
-                      <div style="font-weight:700;">{row.get('NDBI', float('nan')):.3f}</div></div>
+                    <div><div style="font-size:0.72rem;color:#888;text-transform:uppercase;">Mapped Building Coverage (OSM)</div>
+                      <div style="font-weight:700;">{(f"{get_builtup_coverage_percent(search_area_lu):.1f}%" if get_builtup_coverage_percent(search_area_lu) is not None else "Not available")}</div></div>
                     <div><div style="font-size:0.72rem;color:#888;text-transform:uppercase;">Grid Cells</div>
                       <div style="font-weight:700;">{int(row['Grid_Cells'])}</div></div>
                   </div>
@@ -1670,15 +1927,21 @@ elif page == "Event Intelligence":
     # ---------------- Event timeline ----------------
     st.markdown("### 📅 Event Timeline")
     if not events.empty:
-        date_col = find_col(events, ["event_date", "date", "start_date", "start_datetime", "end_datetime"])
+        # Build one usable event date by coalescing available date columns.
+        # Some scraper rows have event_date empty but start_date/start_datetime populated.
+        date_candidates = [c for c in ["event_date", "start_date", "start_datetime", "date", "end_datetime"] if c in events.columns]
         name_col = find_col(events, ["event_name", "name", "title"])
+        date_col = "_parsed_date" if date_candidates else None
         type_col = find_col(events, ["event_type", "type", "category"])
         area_col = find_col(events, ["area_name", "area", "location", "venue", "ward", "ward_name"])
 
         filtered_events = events.copy()
         parsed_dates = None
-        if date_col:
-            parsed_dates = pd.to_datetime(filtered_events[date_col], errors="coerce")
+        if date_candidates:
+            parsed_dates = pd.Series(pd.NaT, index=filtered_events.index, dtype="datetime64[ns]")
+            for candidate in date_candidates:
+                candidate_dates = pd.to_datetime(filtered_events[candidate], errors="coerce")
+                parsed_dates = parsed_dates.fillna(candidate_dates)
 
         # Filters: upcoming/past (only meaningful if we found a date column) + event type
         filt_col1, filt_col2 = st.columns([1, 1.4])
@@ -2158,69 +2421,51 @@ elif page == "Early Warning & Citizen Reports":
     
         st.markdown("### 📝 Submit Waste Report")
 
-        # Read any coordinates the browser already detected via the button below
-        def _get_detected_coords():
-            try:
-                qp = st.query_params
-                lat = float(qp["lat"]) if "lat" in qp else None
-                lon = float(qp["lon"]) if "lon" in qp else None
-                return lat, lon
-            except Exception:
+        # Use a Streamlit geolocation component so coordinates are returned to Python
+        # directly; the old iframe/query-string method was unreliable across browsers.
+        detected_lat = st.session_state.get("citizen_report_lat")
+        detected_lon = st.session_state.get("citizen_report_lon")
+
+        if GEOLOCATION_COMPONENT_AVAILABLE:
+            st.markdown(
+                "<div style='font-weight:700;color:#1b4332;margin:6px 0 3px;'>📍 Use my location</div>"
+                "<div style='font-size:0.82rem;color:#666;margin-bottom:5px;'>Select the location button below and allow your browser to share your location.</div>",
+                unsafe_allow_html=True
+            )
+            location_result = streamlit_geolocation()
+            if isinstance(location_result, dict):
                 try:
-                    qp = st.experimental_get_query_params()
-                    lat = float(qp["lat"][0]) if "lat" in qp else None
-                    lon = float(qp["lon"][0]) if "lon" in qp else None
-                    return lat, lon
-                except Exception:
-                    return None, None
+                    new_lat = float(location_result.get("latitude"))
+                    new_lon = float(location_result.get("longitude"))
+                    if -90 <= new_lat <= 90 and -180 <= new_lon <= 180:
+                        st.session_state["citizen_report_lat"] = new_lat
+                        st.session_state["citizen_report_lon"] = new_lon
+                        detected_lat, detected_lon = new_lat, new_lon
+                except (TypeError, ValueError):
+                    pass
+        else:
+            st.warning("For the GPS button, install the optional component once: `python -m pip install streamlit-geolocation`. "
+                       "Until then, you can enter coordinates manually below.")
 
-        detected_lat, detected_lon = _get_detected_coords()
-
-        components.html("""
-        <div style="margin-bottom:6px;">
-          <button onclick="detectLocation()" style="background:#1b4332;color:white;border:none;
-            padding:8px 16px;border-radius:8px;cursor:pointer;font-size:13px;font-family:sans-serif;">
-            📍 Use my current location
-          </button>
-          <span id="geo-status" style="margin-left:10px;font-size:12px;color:#888;font-family:sans-serif;"></span>
-        </div>
-        <script>
-        function detectLocation() {
-          const status = document.getElementById('geo-status');
-          if (!navigator.geolocation) {
-            status.innerText = "Geolocation isn't supported by this browser.";
-            return;
-          }
-          status.innerText = "Detecting your location…";
-          navigator.geolocation.getCurrentPosition(function(pos) {
-            const lat = pos.coords.latitude.toFixed(6);
-            const lon = pos.coords.longitude.toFixed(6);
-            const params = new URLSearchParams(window.parent.location.search);
-            params.set('lat', lat);
-            params.set('lon', lon);
-            window.parent.location.search = params.toString();
-          }, function(err) {
-            if (err.code === 1) {
-              status.innerText = "Location permission denied — enter coordinates manually.";
-            } else if (err.code === 2) {
-              status.innerText = "Position unavailable — check Location Services is on.";
-            } else if (err.code === 3) {
-              status.innerText = "Timed out waiting for a location fix — enter a landmark instead.";
-            } else {
-              status.innerText = "Couldn't get your location — enter coordinates manually.";
-            }
-          }, {
-            timeout: 8000,
-            maximumAge: 0
-          });
-        }
-        </script>
-        """, height=50)
+        with st.expander("Enter coordinates manually (optional)"):
+            manual_col1, manual_col2 = st.columns(2)
+            with manual_col1:
+                manual_lat = st.number_input("Latitude", min_value=-90.0, max_value=90.0,
+                                             value=float(detected_lat) if detected_lat is not None else 12.9716,
+                                             format="%.6f", key="manual_report_lat")
+            with manual_col2:
+                manual_lon = st.number_input("Longitude", min_value=-180.0, max_value=180.0,
+                                             value=float(detected_lon) if detected_lon is not None else 77.5946,
+                                             format="%.6f", key="manual_report_lon")
+            if st.button("Use these coordinates", key="use_manual_report_coords"):
+                st.session_state["citizen_report_lat"] = float(manual_lat)
+                st.session_state["citizen_report_lon"] = float(manual_lon)
+                st.rerun()
 
         if detected_lat is not None and detected_lon is not None:
-            st.success(f"📍 Your location has been detected and will be attached to this report.")
+            st.success("📍 Location is ready and will be attached to your report.")
         else:
-            st.caption("Tap \"Use my current location\" above so we can pinpoint your report precisely — or just describe the landmark below.")
+            st.caption("Allow location permission when prompted, or enter coordinates manually. GPS works on localhost or a secure HTTPS connection.")
 
         # Report form — no raw coordinates shown to the citizen; location comes from
         # the geolocation button above (captured silently) plus a plain-language landmark
@@ -2250,16 +2495,9 @@ elif page == "Early Warning & Citizen Reports":
                 st.warning("No precise location was detected, so this report was saved with only the landmark/description you gave — "
                            "click \"Use my current location\" next time for a pinpointed report.")
 
-            # Match to the nearest ward if we have coordinates, so Risk Map can show this
-            # report when someone views that ward — same nearest-point approach used
-            # throughout the routing pages.
-            matched_ward = None
-            if latitude is not None and longitude is not None and not centroids.empty:
-                distances = centroids.apply(
-                    lambda row: haversine_km(latitude, longitude, row["Latitude"], row["Longitude"]), axis=1)
-                nearest_idx = distances.idxmin()
-                if distances.loc[nearest_idx] < 5:  # within 5 km — otherwise don't force a match
-                    matched_ward = centroids.loc[nearest_idx, "area_name"]
+            # First match the GPS point to the actual ward polygon. If it falls
+            # outside the polygons, only accept a nearby centroid (within 2 km).
+            matched_ward = match_report_to_ward(latitude, longitude)
 
             # No GPS match — fall back to matching the typed landmark text against
             # real ward names (exact match first, then "landmark contains ward name")
@@ -2317,8 +2555,11 @@ elif page == "Early Warning & Citizen Reports":
             with open(REPORTS_FILE, 'w', encoding='utf-8') as f:
                 json.dump(existing_reports, f, indent=2, default=str)
 
-            # Force a fresh reload so this report shows up immediately elsewhere in the app
+            # Clear cached data and refresh the report table/map from the saved JSON.
             load_data.clear()
+            citizen_reports = pd.DataFrame(existing_reports)
+            st.session_state.pop("citizen_report_lat", None)
+            st.session_state.pop("citizen_report_lon", None)
 
             st.success("Report submitted successfully! Thank you for helping keep Bengaluru clean.")
             if matched_ward:
